@@ -1,0 +1,168 @@
+name: RDP-Session ˢᵃᶤᶠ ₉₁
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 355
+
+    steps:
+
+      # ─────────────────────────────────────────────
+      # 1. تحميل ملفاتك المحلية من الريبو تلقائياً
+      # ─────────────────────────────────────────────
+      - name: 1. Checkout Files
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────
+      # 2. تفعيل RDP وإعداد الشبكة
+      # ─────────────────────────────────────────────
+      - name: 2. Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule `
+            name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          Write-Host "RDP enabled."
+
+      # ─────────────────────────────────────────────
+      # 3. إنشاء مستخدم admin / admin
+      # ─────────────────────────────────────────────
+      - name: 3. Create Admin User
+        run: |
+          $user = "admin"
+          $pass = "admin"
+
+          # ── تعطيل شرط التعقيد أولاً ──
+          secedit /export /cfg "$env:TEMP\sec.cfg" | Out-Null
+          (Get-Content "$env:TEMP\sec.cfg") `
+            -replace 'PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0' `
+            -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0' |
+            Set-Content "$env:TEMP\sec.cfg"
+          secedit /configure /db "$env:TEMP\sec.db" /cfg "$env:TEMP\sec.cfg" /quiet
+
+          # ── إنشاء المستخدم ──
+          $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $secure -AccountNeverExpires -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name $user -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Administrators"       -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+
+          Write-Host "User: $user | Pass: $pass"
+
+      # ─────────────────────────────────────────────
+      # 4. نسخ ملفاتك للـ Desktop تلقائياً
+      # ─────────────────────────────────────────────
+      - name: 4. Copy Your Files to Desktop
+        run: |
+          $desktop = "C:\Users\admin\Desktop"
+          New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+
+          # ينسخ كل الملفات من مجلد "my-files" داخل الريبو للـ Desktop
+          $src = "$env:GITHUB_WORKSPACE\my-files"
+          if (Test-Path $src) {
+            Copy-Item -Path "$src\*" -Destination $desktop -Recurse -Force
+            Write-Host "Files copied to Desktop."
+          } else {
+            Write-Host "No 'my-files' folder found in repo — skipping."
+          }
+
+      # ─────────────────────────────────────────────
+      # 5. تثبيت Tampermonkey فقط (بدون إضافات ثانية)
+      # ─────────────────────────────────────────────
+      - name: 5. Configure Firefox + Tampermonkey Only
+        run: |
+          $distDir = "C:\Program Files\Mozilla Firefox\distribution"
+          if (!(Test-Path $distDir)) { New-Item -ItemType Directory -Force -Path $distDir | Out-Null }
+
+          $policies = @{
+            policies = @{
+              Extensions = @{
+                Install = @(
+                  "https://addons.mozilla.org/firefox/downloads/latest/tampermonkey/latest.xpi"
+                )
+              }
+              DisableAppUpdate        = $true
+              DontCheckDefaultBrowser = $true
+              Homepage = @{
+                URL       = "https://gartic.io"
+                StartPage = "homepage"
+              }
+            }
+          }
+
+          $policies | ConvertTo-Json -Depth 5 | Out-File "$distDir\policies.json" -Encoding UTF8
+          Write-Host "Firefox configured: Tampermonkey only."
+
+      # ─────────────────────────────────────────────
+      # 6. تثبيت Tailscale والاتصال
+      # ─────────────────────────────────────────────
+      - name: 6. Install & Connect Tailscale
+        run: |
+          $installer = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $installer -UseBasicParsing
+          Start-Process $installer -ArgumentList "/quiet", "/norestart" -Wait
+
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=rdp-session `
+            --accept-routes
+
+          Start-Sleep -Seconds 8
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "Tailscale IP: $ip"
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # 7. تشغيل Firefox + عرض بيانات الاتصال
+      # ─────────────────────────────────────────────
+      - name: 7. Launch Firefox & Show RDP Info
+        run: |
+          Start-Process "C:\Program Files\Mozilla Firefox\firefox.exe"
+          Write-Host "========================================"
+          Write-Host "  RDP CONNECTION INFO"
+          Write-Host "========================================"
+          Write-Host "  IP   : $env:TAILSCALE_IP"
+          Write-Host "  User : admin"
+          Write-Host "  Pass : admin"
+          Write-Host "  Port : 3389"
+          Write-Host "========================================"
+          echo "::notice title=RDP INFO::IP=$env:TAILSCALE_IP | User=admin | Pass=admin | Port=3389"
+
+      # ─────────────────────────────────────────────
+      # 8. Keep-Alive ذكي — يحافظ على الاتصال 6 ساعات
+      #    بدون ما يستهلك CPU أو يسبب timeout
+      # ─────────────────────────────────────────────
+      - name: 8. Keep-Alive (6 Hours)
+        run: |
+          $endTime   = (Get-Date).AddMinutes(350)
+          $pingEvery = 60        # ثانية بين كل دورة
+          $reportEvery = 10      # كل 10 دقائق يكتب تقرير
+
+          $cycle = 0
+
+          while ((Get-Date) -lt $endTime) {
+            Start-Sleep -Seconds $pingEvery
+            $cycle++
+
+            # كل 10 دقائق: تقرير حي في اللوج
+            if ($cycle % $reportEvery -eq 0) {
+              $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ALIVE — ${remaining} minutes remaining"
+            }
+
+
+          }
+
+          Write-Host "Session complete. 6-hour window finished."
